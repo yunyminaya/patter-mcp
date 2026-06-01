@@ -33,12 +33,11 @@
 import {
   Patter,
   Twilio,
-  DeepgramSTT,
-  ElevenLabsTTS,
   Tool,
   type CallResult,
   type CallOutcome,
 } from "getpatter";
+import { resolveAgentConfig, type AgentConfigInput } from "./agent-config.js";
 import { allVoiceTools } from "./voice-tools.js";
 import { endCallSession } from "./claude-bridge.js";
 import {
@@ -74,13 +73,15 @@ export interface CallRecord {
   userId?: string;
 }
 
-export interface MakeCallOptions {
+export interface MakeCallOptions extends AgentConfigInput {
   to: string;
-  systemPrompt: string;
-  firstMessage?: string;
-  voice?: string;
+  /** Enable answering-machine detection (default true in the SDK). */
   machineDetection?: boolean;
+  /** Message left if the call reaches voicemail. */
   voicemailMessage?: string;
+  /** Seconds to ring before giving up (SDK default 25s). */
+  ringTimeout?: number;
+  /** Owner of the call (populated when auth is enabled). */
   userId?: string;
 }
 
@@ -103,6 +104,10 @@ function mergeRecord(
 export class PatterServer {
   private phone: Patter;
   private serverRunning = false;
+  /** The inbound agent config last served — retained so it can be re-served. */
+  private inboundConfig?: AgentConfigInput;
+  /** Optional sink for inbound lifecycle events (wired to MCP notifications). */
+  private notifier?: (method: string, params: Record<string, unknown>) => void;
 
   /**
    * Write-through cache for call records. Populated by the inbound lifecycle
@@ -152,30 +157,27 @@ export class PatterServer {
     return record;
   }
 
-  /** Create a Patter agent with voice tools attached. */
-  private createAgent(
-    systemPrompt: string,
-    firstMessage?: string,
-    voice?: string,
-  ) {
-    return this.phone.agent({
-      systemPrompt,
-      voice: voice || "nova",
-      firstMessage: firstMessage || "Hello!",
-      // No `engine` argument → pipeline mode (STT → LLM → TTS).
-      stt: new DeepgramSTT({ apiKey: process.env.DEEPGRAM_API_KEY }),
-      tts: new ElevenLabsTTS({
-        apiKey: process.env.ELEVENLABS_API_KEY,
-        voiceId: voice || "nova",
-      }),
-      tools: allVoiceTools.map((t) =>
+  /**
+   * Build a Patter agent from a string-based MCP config.
+   *
+   * The provider/engine selection is delegated to {@link resolveAgentConfig};
+   * here we only attach the in-call `claude_code` voice tool (file/command/
+   * search access during the call) ahead of any caller-supplied webhook tools.
+   */
+  private createAgent(config: AgentConfigInput) {
+    const resolved = resolveAgentConfig(config);
+    const voiceTools = allVoiceTools.map(
+      (t) =>
         new Tool({
           name: t.name,
           description: t.description,
           parameters: t.parameters,
           handler: t.handler,
         }),
-      ),
+    );
+    return this.phone.agent({
+      ...resolved,
+      tools: [...voiceTools, ...(resolved.tools ?? [])],
     });
   }
 
@@ -212,6 +214,11 @@ export class PatterServer {
     };
     this.persist(record);
     log(`inbound call ${carrierId} from ${data.caller}`);
+    this.notify("notifications/patter/incoming_call", {
+      callId: carrierId,
+      from: (data.caller as string | undefined) ?? null,
+      to: (data.callee as string | undefined) ?? null,
+    });
   };
 
   /**
@@ -250,11 +257,48 @@ export class PatterServer {
     this.persist(updated);
     await endCallSession(carrierId);
     log(`inbound call ${carrierId} ended — ${updated.duration}s`);
+    this.notify("notifications/patter/call_ended", {
+      callId: carrierId,
+      duration: updated.duration ?? 0,
+      outcome: updated.outcome ?? null,
+    });
   };
 
   // -------------------------------------------------------------------------
   // Public server management
   // -------------------------------------------------------------------------
+
+  /** Wire a sink for inbound lifecycle events (e.g. MCP notifications). */
+  setNotifier(fn: (method: string, params: Record<string, unknown>) => void): void {
+    this.notifier = fn;
+  }
+
+  /** Emit an inbound lifecycle event to the wired notifier (best-effort). */
+  private notify(method: string, params: Record<string, unknown>): void {
+    try {
+      this.notifier?.(method, params);
+    } catch {
+      /* notifications are best-effort — never let them break a call */
+    }
+  }
+
+  /**
+   * Replace the inbound agent and (re)start the server so incoming calls use
+   * the new configuration. Validates the config first (surfacing bad provider
+   * names / missing keys) before tearing anything down. When the server is
+   * already running it is restarted — the cloudflared tunnel URL changes and
+   * the carrier webhook is re-pointed by `serve()`, so a brief reconnect is
+   * expected.
+   */
+  async reconfigureInbound(config: AgentConfigInput): Promise<void> {
+    resolveAgentConfig(config); // validate before any teardown
+    if (this.serverRunning) {
+      await this.phone.disconnect();
+      this.serverRunning = false;
+    }
+    const port = Number(process.env.PATTER_PORT ?? "8000");
+    await this.startServer(config, port);
+  }
 
   /**
    * Start the embedded Patter server in the background.
@@ -265,15 +309,11 @@ export class PatterServer {
    * lets `call({ wait: true })` resolve — its terminal signals (carrier
    * status callback, AMD, media-stream end) arrive on this server's webhooks.
    */
-  async startServer(
-    systemPrompt: string,
-    firstMessage?: string,
-    voice?: string,
-    port = 8000,
-  ): Promise<void> {
+  async startServer(config: AgentConfigInput, port = 8000): Promise<void> {
     if (this.serverRunning) return;
 
-    const agent = this.createAgent(systemPrompt, firstMessage, voice);
+    this.inboundConfig = config;
+    const agent = this.createAgent(config);
 
     this.phone
       .serve({
@@ -352,17 +392,10 @@ export class PatterServer {
    * the right home for ephemeral "calls live right now" state.
    */
   async makeCall(options: MakeCallOptions): Promise<CallRecord> {
-    const {
-      to,
-      systemPrompt,
-      firstMessage,
-      voice,
-      machineDetection,
-      voicemailMessage,
-      userId,
-    } = options;
+    const { to, machineDetection, voicemailMessage, ringTimeout, userId, ...agentConfig } =
+      options;
 
-    const agent = this.createAgent(systemPrompt, firstMessage, voice);
+    const agent = this.createAgent(agentConfig);
     const startedAt = Date.now();
     incrementConcurrent(userId);
 
@@ -372,6 +405,7 @@ export class PatterServer {
         agent,
         machineDetection,
         voicemailMessage,
+        ...(ringTimeout !== undefined ? { ringTimeout } : {}),
         wait: true,
       });
 
@@ -397,6 +431,19 @@ export class PatterServer {
     } finally {
       decrementConcurrent(userId);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Live-call control
+  // -------------------------------------------------------------------------
+
+  /**
+   * Hang up a live call by its carrier id. Inbound records are finalised by the
+   * server-wide `onCallEnd` handler; outbound calls are owned by `makeCall`.
+   */
+  async endCall(callId: string): Promise<void> {
+    await this.phone.endCall(callId);
+    log(`end_call requested for ${callId}`);
   }
 
   // -------------------------------------------------------------------------

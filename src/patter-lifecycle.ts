@@ -56,9 +56,12 @@ export function getPatter(): Promise<PatterServer> {
     const patter = createPatter();
     log("Booting Patter server (first tool call, lazy mode)...");
     await patter.startServer(
-      process.env.AGENT_SYSTEM_PROMPT ?? defaultPrompt,
-      process.env.AGENT_FIRST_MESSAGE ?? "Hello! I'm your AI assistant. How can I help?",
-      process.env.AGENT_VOICE ?? "nova",
+      {
+        systemPrompt: process.env.AGENT_SYSTEM_PROMPT ?? defaultPrompt,
+        firstMessage:
+          process.env.AGENT_FIRST_MESSAGE ?? "Hello! I'm your AI assistant. How can I help?",
+        voice: process.env.AGENT_VOICE ?? "nova",
+      },
       PATTER_PORT,
     );
     return patter;
