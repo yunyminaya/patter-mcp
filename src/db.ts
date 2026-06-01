@@ -1,65 +1,27 @@
 /**
- * SQLite persistence layer for call records.
+ * Local persistence layer for call records.
  *
- * Uses better-sqlite3 (synchronous) for local storage.
- * Gracefully falls back to a no-op in-memory mode if the
- * native binary is unavailable (e.g. some container environments).
+ * Stores call records in a single local JSON file with write-through and
+ * atomic replacement (temp file + rename). Zero native dependencies: this
+ * replaces the former better-sqlite3 backend, whose native binary could not be
+ * dynamically required from the bundled ESM `dist/index.js` ("Dynamic require
+ * of better-sqlite3 is not supported"), forcing a lossy in-memory fallback.
+ *
+ * "Local" was always the intent — SQLite was just a file too — so this keeps
+ * everything local while removing the native binary + ESM-bundling friction.
+ * Call volume for an MCP phone agent is modest and the process is single
+ * threaded, so a write-through JSON file is more than sufficient.
+ *
+ * When `PATTER_DB_PATH` is ":memory:" the store is pure in-memory (no disk
+ * I/O) — used by tests.
+ *
+ * Immutability: reads always return deep clones so callers can never mutate
+ * the backing store, and writes clone the incoming record before storing it.
  */
+
+import { existsSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 
 import type { CallRecord } from "./patter-server.js";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/** A row as stored in the calls table (snake_case, JSON-serialised fields). */
-interface CallRow {
-  call_id: string;
-  user_id: string | null;
-  to_number: string | null;
-  from_number: string | null;
-  direction: "outbound" | "inbound";
-  status: "ringing" | "in-progress" | "completed" | "failed";
-  outcome: string | null;
-  started_at: number;
-  ended_at: number | null;
-  duration: number | null;
-  transcript: string | null;
-  metrics: string | null;
-}
-
-// ---------------------------------------------------------------------------
-// Schema
-// ---------------------------------------------------------------------------
-
-const CREATE_TABLE = `
-CREATE TABLE IF NOT EXISTS calls (
-  call_id    TEXT PRIMARY KEY,
-  user_id    TEXT,
-  to_number  TEXT,
-  from_number TEXT,
-  direction  TEXT NOT NULL CHECK(direction IN ('outbound', 'inbound')),
-  status     TEXT NOT NULL CHECK(status IN ('ringing', 'in-progress', 'completed', 'failed')),
-  outcome    TEXT,
-  started_at INTEGER NOT NULL,
-  ended_at   INTEGER,
-  duration   INTEGER,
-  transcript TEXT,
-  metrics    TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_calls_user_id ON calls(user_id);
-CREATE INDEX IF NOT EXISTS idx_calls_status  ON calls(status);
-`.trim();
-
-/**
- * Idempotent migration for databases created before the `outcome` column
- * existed. `ALTER TABLE ... ADD COLUMN` throws "duplicate column name" when
- * the column is already present, so the caller swallows that specific error.
- */
-const MIGRATIONS: ReadonlyArray<string> = [
-  "ALTER TABLE calls ADD COLUMN outcome TEXT",
-];
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -70,294 +32,179 @@ function log(msg: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Row <-> CallRecord conversion (immutable — always return new objects)
+// Config
 // ---------------------------------------------------------------------------
 
-function safeParseJson<T>(raw: string | null, fallback: T): T {
-  if (!raw) return fallback;
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    log("Corrupt JSON column, using fallback");
-    return fallback;
-  }
-}
+/** Path to the local JSON store. ":memory:" disables disk I/O (tests). */
+export const DB_PATH = process.env.PATTER_DB_PATH ?? "patter-mcp.json";
 
-function rowToRecord(row: CallRow): CallRecord {
-  return {
-    callId: row.call_id,
-    userId: row.user_id ?? undefined,
-    to: row.to_number ?? undefined,
-    from: row.from_number ?? undefined,
-    direction: row.direction,
-    status: row.status,
-    outcome: (row.outcome as CallRecord["outcome"]) ?? undefined,
-    startedAt: row.started_at,
-    endedAt: row.ended_at ?? undefined,
-    duration: row.duration ?? undefined,
-    transcript: safeParseJson<Array<{ role: string; text: string }>>(
-      row.transcript,
-      [],
-    ),
-    metrics: safeParseJson<Record<string, unknown> | undefined>(
-      row.metrics,
-      undefined,
-    ),
-  };
-}
-
-function recordToRow(r: CallRecord): CallRow {
-  return {
-    call_id: r.callId,
-    user_id: r.userId ?? null,
-    to_number: r.to ?? null,
-    from_number: r.from ?? null,
-    direction: r.direction,
-    status: r.status,
-    outcome: r.outcome ?? null,
-    started_at: r.startedAt,
-    ended_at: r.endedAt ?? null,
-    duration: r.duration ?? null,
-    transcript: JSON.stringify(r.transcript),
-    metrics: r.metrics !== undefined ? JSON.stringify(r.metrics) : null,
-  };
-}
+const IN_MEMORY = DB_PATH === ":memory:";
 
 // ---------------------------------------------------------------------------
-// DB handle (module-level singleton)
+// State (module-level singleton)
 // ---------------------------------------------------------------------------
 
-type Database = import("better-sqlite3").Database;
-type Statement = import("better-sqlite3").Statement;
+const store = new Map<string, CallRecord>();
+let _loaded = false;
+let _available = false;
 
-interface Statements {
-  upsert: Statement;
-  selectOne: Statement;
-  selectByUser: Statement;
-  selectAll: Statement;
-  countDailyByUser: Statement;
-  countConcurrentByUser: Statement;
-  sumHourlyCost: Statement;
-}
-
-let db: Database | undefined;
-let stmts: Statements | undefined;
-
-/** True when the SQLite database initialised successfully. */
-let _dbAvailable = false;
-
-/** Returns true when the SQLite database initialised successfully. */
+/** Returns true once the local store has been initialised. */
 export function isDbAvailable(): boolean {
-  return _dbAvailable;
+  return _available;
+}
+
+function clone<T>(value: T): T {
+  return structuredClone(value);
 }
 
 // ---------------------------------------------------------------------------
-// Exported path so callers / tests can inspect where the DB lives
+// Disk I/O — atomic write-through
 // ---------------------------------------------------------------------------
 
-export const DB_PATH =
-  process.env.PATTER_DB_PATH ?? "patter-mcp.db";
+/**
+ * Persist the entire store to disk atomically: write to a temp file then
+ * rename over the target (rename is atomic on POSIX). No-op in memory mode.
+ */
+function flush(): void {
+  if (IN_MEMORY) return;
+  const data = JSON.stringify(Array.from(store.values()));
+  const tmp = `${DB_PATH}.tmp`;
+  writeFileSync(tmp, data, "utf8");
+  renameSync(tmp, DB_PATH);
+}
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-function prepareStatements(database: Database): Statements {
-  return {
-    upsert: database.prepare(`
-      INSERT INTO calls (
-        call_id, user_id, to_number, from_number,
-        direction, status, outcome, started_at, ended_at,
-        duration, transcript, metrics
-      ) VALUES (
-        @call_id, @user_id, @to_number, @from_number,
-        @direction, @status, @outcome, @started_at, @ended_at,
-        @duration, @transcript, @metrics
-      )
-      ON CONFLICT(call_id) DO UPDATE SET
-        user_id      = excluded.user_id,
-        to_number    = excluded.to_number,
-        from_number  = excluded.from_number,
-        direction    = excluded.direction,
-        status       = excluded.status,
-        outcome      = excluded.outcome,
-        started_at   = excluded.started_at,
-        ended_at     = excluded.ended_at,
-        duration     = excluded.duration,
-        transcript   = excluded.transcript,
-        metrics      = excluded.metrics
-    `),
-    selectOne: database.prepare(
-      "SELECT * FROM calls WHERE call_id = ?",
-    ),
-    selectByUser: database.prepare(
-      "SELECT * FROM calls WHERE user_id = ? ORDER BY started_at DESC",
-    ),
-    selectAll: database.prepare(
-      "SELECT * FROM calls ORDER BY started_at DESC",
-    ),
-    /** Count outbound calls placed by a user today (UTC day boundary). */
-    countDailyByUser: database.prepare(`
-      SELECT COUNT(*) as count
-      FROM calls
-      WHERE user_id = ?
-        AND direction = 'outbound'
-        AND started_at >= ?
-    `),
-    /** Count active (ringing or in-progress) outbound calls for a user. */
-    countConcurrentByUser: database.prepare(`
-      SELECT COUNT(*) as count
-      FROM calls
-      WHERE user_id = ?
-        AND direction = 'outbound'
-        AND status IN ('ringing', 'in-progress')
-    `),
-    /**
-     * Sum the total field from the cost JSON within metrics for calls
-     * started within the current hour window.
-     */
-    sumHourlyCost: database.prepare(`
-      SELECT metrics
-      FROM calls
-      WHERE direction = 'outbound'
-        AND started_at >= ?
-        AND metrics IS NOT NULL
-    `),
-  };
-}
-
 /**
- * Apply additive schema migrations to an existing database. Each statement
- * is an `ALTER TABLE ... ADD COLUMN`; the "duplicate column name" error is
- * swallowed so the migration is idempotent across restarts and fresh DBs
- * (where the column already came from CREATE TABLE).
+ * Initialise the local store: load existing records from disk (if any).
+ * Safe to call multiple times — subsequent calls are no-ops.
+ *
+ * A missing or corrupt store file is not fatal: the store starts empty and the
+ * file is overwritten on the next write. The store is always "available" —
+ * unlike the old native backend, there is no environment in which it fails.
  */
-function runMigrations(database: Database): void {
-  for (const statement of MIGRATIONS) {
-    try {
-      database.exec(statement);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (!message.includes("duplicate column name")) {
-        throw err;
+export function initDb(): void {
+  if (_loaded) return;
+  _loaded = true;
+
+  try {
+    if (!IN_MEMORY && existsSync(DB_PATH)) {
+      const records = JSON.parse(readFileSync(DB_PATH, "utf8")) as unknown;
+      if (Array.isArray(records)) {
+        for (const r of records as CallRecord[]) {
+          if (r && typeof r.callId === "string") store.set(r.callId, r);
+        }
       }
     }
+    _available = true;
+    log(
+      IN_MEMORY
+        ? "Local store ready (in-memory)"
+        : `Local store ready at ${DB_PATH} (${store.size} record(s))`,
+    );
+  } catch (err) {
+    // Corrupt/unreadable file — start empty rather than crash. Still available;
+    // the next write replaces the bad file.
+    log(
+      `WARNING: could not read ${DB_PATH}, starting empty. ` +
+        `Reason: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    store.clear();
+    _available = true;
   }
 }
 
-/**
- * Initialise the SQLite connection and create tables.
- * Safe to call multiple times — subsequent calls are no-ops.
- *
- * Falls back to a no-op in-memory mode and logs a warning when
- * better-sqlite3's native binary cannot be loaded.
- */
-export function initDb(): void {
-  if (_dbAvailable) return;
-
+/** Insert or update a call record, persisting to disk write-through. */
+export function upsertCall(record: CallRecord): void {
+  if (!_available) return;
+  store.set(record.callId, clone(record));
   try {
-    // Dynamic import keeps the module loadable even when the native
-    // binary is missing — the error only surfaces here, not at import time.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const BetterSqlite3 = require("better-sqlite3") as typeof import("better-sqlite3");
-    db = new BetterSqlite3(DB_PATH);
-    db.exec(CREATE_TABLE);
-    runMigrations(db);
-    stmts = prepareStatements(db);
-    _dbAvailable = true;
-    log(`SQLite ready at ${DB_PATH}`);
+    flush();
   } catch (err) {
     log(
-      `WARNING: SQLite unavailable — falling back to in-memory mode. ` +
-      `Reason: ${err instanceof Error ? err.message : String(err)}`,
+      `WARNING: failed to persist ${record.callId}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
     );
   }
 }
 
-/**
- * Insert or update a call record in the database.
- * No-op when DB is unavailable.
- */
-export function upsertCall(record: CallRecord): void {
-  if (!_dbAvailable || !stmts) return;
-  const row = recordToRow(record);
-  stmts.upsert.run(row);
-}
-
-/**
- * Retrieve a single call by ID.
- * Returns `undefined` when not found or DB is unavailable.
- */
+/** Retrieve a single call by ID, or `undefined` when not found. */
 export function getCall(callId: string): CallRecord | undefined {
-  if (!_dbAvailable || !stmts) return undefined;
-  const row = stmts.selectOne.get(callId) as CallRow | undefined;
-  return row ? rowToRecord(row) : undefined;
+  if (!_available) return undefined;
+  const record = store.get(callId);
+  return record ? clone(record) : undefined;
+}
+
+/** Most-recent-first ordering helper. */
+function byStartedAtDesc(records: CallRecord[]): CallRecord[] {
+  return records.sort((a, b) => b.startedAt - a.startedAt);
 }
 
 /**
- * Return all calls belonging to `userId`, or every call when `userId`
- * is `undefined` (unauthenticated / admin mode).
+ * Return all calls belonging to `userId`, or every call when `userId` is
+ * `undefined` (unauthenticated / admin mode), most recent first.
  */
 export function getCallsByUser(userId?: string): CallRecord[] {
-  if (!_dbAvailable || !stmts) return [];
-  const rows =
-    userId !== undefined
-      ? (stmts.selectByUser.all(userId) as CallRow[])
-      : (stmts.selectAll.all() as CallRow[]);
-  return rows.map(rowToRecord);
+  if (!_available) return [];
+  const all = Array.from(store.values());
+  const filtered = userId !== undefined ? all.filter((r) => r.userId === userId) : all;
+  return byStartedAtDesc(filtered).map(clone);
 }
 
-/**
- * Return every call record in the database.
- */
+/** Return every call record, most recent first. */
 export function getAllCalls(): CallRecord[] {
-  if (!_dbAvailable || !stmts) return [];
-  return (stmts.selectAll.all() as CallRow[]).map(rowToRecord);
+  if (!_available) return [];
+  return byStartedAtDesc(Array.from(store.values())).map(clone);
 }
 
 /**
  * Count outbound calls placed by `userId` since `sinceMs` (epoch ms).
- * Returns 0 when the DB is unavailable.
  */
 export function countDailyCallsByUser(userId: string, sinceMs: number): number {
-  if (!_dbAvailable || !stmts) return 0;
-  const row = stmts.countDailyByUser.get(userId, sinceMs) as
-    | { count: number }
-    | undefined;
-  return row?.count ?? 0;
+  if (!_available) return 0;
+  let count = 0;
+  for (const r of store.values()) {
+    if (r.userId === userId && r.direction === "outbound" && r.startedAt >= sinceMs) {
+      count++;
+    }
+  }
+  return count;
 }
 
 /**
  * Count active (ringing or in-progress) outbound calls for `userId`.
- * Returns 0 when the DB is unavailable.
  */
 export function countConcurrentCallsByUser(userId: string): number {
-  if (!_dbAvailable || !stmts) return 0;
-  const row = stmts.countConcurrentByUser.get(userId) as
-    | { count: number }
-    | undefined;
-  return row?.count ?? 0;
+  if (!_available) return 0;
+  let count = 0;
+  for (const r of store.values()) {
+    if (
+      r.userId === userId &&
+      r.direction === "outbound" &&
+      (r.status === "ringing" || r.status === "in-progress")
+    ) {
+      count++;
+    }
+  }
+  return count;
 }
 
 /**
- * Sum estimated call costs for all outbound calls started since `sinceMs`.
- * Reads the `cost.total` field from the JSON-serialised metrics column.
- * Returns 0 when the DB is unavailable or no metrics are recorded.
+ * Sum estimated call costs (`metrics.cost.total`) for all outbound calls
+ * started since `sinceMs`. Returns 0 when no metrics are recorded.
  */
 export function sumHourlyCostUsd(sinceMs: number): number {
-  if (!_dbAvailable || !stmts) return 0;
-
-  const rows = stmts.sumHourlyCost.all(sinceMs) as Array<{ metrics: string }>;
+  if (!_available) return 0;
   let total = 0;
-  for (const row of rows) {
-    try {
-      const metrics = JSON.parse(row.metrics) as Record<string, unknown>;
-      const cost = metrics.cost as Record<string, unknown> | undefined;
-      if (typeof cost?.total === "number") {
-        total += cost.total;
-      }
-    } catch {
-      // malformed metrics — skip
+  for (const r of store.values()) {
+    if (r.direction !== "outbound" || r.startedAt < sinceMs || !r.metrics) continue;
+    const cost = (r.metrics as Record<string, unknown>).cost as
+      | Record<string, unknown>
+      | undefined;
+    if (typeof cost?.total === "number") {
+      total += cost.total;
     }
   }
   return total;
