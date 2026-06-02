@@ -6,9 +6,14 @@ dist/
 .DS_Store
 .worktrees/
 
-# SQLite databases
+# Local call store (JSON) + legacy SQLite databases
+patter-mcp.json
+patter-mcp.json.tmp
 *.db
 *.db-shm
 *.db-wal
 .claude/
 CLAUDE.md
+
+# mcp-use runtime state (sessions + generated tool registry)
+.mcp-use/

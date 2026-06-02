@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { makeCallHandler } from "./make-call.js";
+import { describe, it, expect, vi, beforeAll } from "vitest";
+import { makeCallHandler, planCall } from "./make-call.js";
 import type { PatterServer, CallRecord } from "../patter-server.js";
 
 // ---------------------------------------------------------------------------
@@ -123,7 +123,7 @@ describe("makeCallHandler", () => {
     });
   });
 
-  it("includes a get_transcript hint in the success message", async () => {
+  it("exposes a transcript resource link in the structured output", async () => {
     const patter = makeMockPatter(() =>
       Promise.resolve(makeCompletedRecord({ callId: "call_hints_test" })),
     );
@@ -133,8 +133,10 @@ describe("makeCallHandler", () => {
       patter,
     );
 
-    expect(result.content[0].text).toContain("get_transcript");
-    expect(result.content[0].text).toContain("call_hints_test");
+    expect(result.structuredContent?.transcriptUri).toBe(
+      "patter://call/call_hints_test/transcript",
+    );
+    expect(result.structuredContent?.callId).toBe("call_hints_test");
   });
 
   it("returns an error result when patter.makeCall throws", async () => {
@@ -180,5 +182,50 @@ describe("makeCallHandler", () => {
     expect(patter.makeCall).toHaveBeenCalledWith(
       expect.objectContaining({ userId: undefined }),
     );
+  });
+
+  it("returns structured content mirroring the call result", async () => {
+    const patter = makeMockPatter(() =>
+      Promise.resolve(
+        makeCompletedRecord({ callId: "call_struct", duration: 30, outcome: "answered" }),
+      ),
+    );
+
+    const result = await makeCallHandler({ to: "+15551234567", systemPrompt: "x" }, patter);
+
+    expect(result.structuredContent).toMatchObject({
+      status: "completed",
+      callId: "call_struct",
+      outcome: "answered",
+      durationSeconds: 30,
+      costUsd: 0.02,
+    });
+  });
+});
+
+describe("planCall (dry run)", () => {
+  beforeAll(() => {
+    process.env.DEEPGRAM_API_KEY = "test-dg";
+    process.env.ELEVENLABS_API_KEY = "test-el";
+    process.env.OPENAI_API_KEY = "sk-test";
+  });
+
+  it("returns a resolved plan + cost estimate without placing a call", () => {
+    const { plan, estimatedCostUsd } = planCall({
+      to: "+15551234567",
+      systemPrompt: "x",
+      ttsProvider: "elevenlabs",
+    });
+    expect(plan.to).toBe("+15551234567");
+    expect(plan.engineMode).toBe("pipeline");
+    expect(plan.sttProvider).toBe("deepgram");
+    expect(plan.ttsProvider).toBe("elevenlabs");
+    expect(estimatedCostUsd).toBeGreaterThan(0);
+  });
+
+  it("throws a clear error on an invalid provider", () => {
+    expect(() =>
+      planCall({ to: "+15551234567", systemPrompt: "x", sttProvider: "bogus" as never }),
+    ).toThrow(/Unknown STT provider/);
   });
 });
