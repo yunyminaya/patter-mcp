@@ -60,10 +60,10 @@ npm run dev    # or: npm run build && npm start  — serves Streamable HTTP at :
 claude mcp add --transport http patter-mcp http://localhost:3000/mcp
 ```
 
-**stdio:** pass `--stdio` and the client launches the server itself:
+**stdio:** build once (`npm run build`), then have the client launch the built server with `--stdio`:
 
 ```bash
-claude mcp add patter-mcp -- npx -y getpatter-mcp --stdio
+claude mcp add patter-mcp -- node /absolute/path/to/patter-mcp/dist/index.js --stdio
 ```
 
 See [stdio transport](#stdio-transport-openclaw--hermes--claude-desktop) for
@@ -310,7 +310,7 @@ than connect to a URL) use the stdio transport. Launch it with the `--stdio`
 flag (or `MCP_TRANSPORT=stdio`):
 
 ```bash
-npx -y getpatter-mcp --stdio
+node dist/index.js --stdio    # from your cloned, built patter-mcp checkout
 # stdout carries the raw JSON-RPC stream; all logs go to stderr.
 ```
 
@@ -334,8 +334,8 @@ sandbox (without `alsoAllow` the tools exist but the agent can't call them):
     servers: {
       "patter-mcp": {
         transport: "stdio",
-        command: "npx",
-        args: ["-y", "getpatter-mcp", "--stdio"],
+        command: "node",
+        args: ["/absolute/path/to/patter-mcp/dist/index.js", "--stdio"],
         env: {
           TWILIO_ACCOUNT_SID: "AC...",
           TWILIO_AUTH_TOKEN: "...",
@@ -362,8 +362,8 @@ sandbox (without `alsoAllow` the tools exist but the agent can't call them):
 ```yaml
 mcp_servers:
   patter-mcp:
-    command: npx
-    args: ["-y", "getpatter-mcp", "--stdio"]
+    command: node
+    args: ["/absolute/path/to/patter-mcp/dist/index.js", "--stdio"]
     env:
       TWILIO_ACCOUNT_SID: "AC..."
       TWILIO_AUTH_TOKEN: "..."
@@ -378,8 +378,8 @@ mcp_servers:
 {
   "mcpServers": {
     "patter-mcp": {
-      "command": "npx",
-      "args": ["-y", "getpatter-mcp", "--stdio"]
+      "command": "node",
+      "args": ["/absolute/path/to/patter-mcp/dist/index.js", "--stdio"]
     }
   }
 }
@@ -395,30 +395,31 @@ npm start            # Run built version
 
 ## Distribution
 
-`patter-mcp` ships in two transports:
+`patter-mcp` is **run from a local clone** — it is intentionally not published to
+a package registry. MCP servers run on your own machine, alongside your carrier
+and provider credentials; cloning keeps the trust boundary on the repo. Set it up
+once:
 
-- **HTTP (Streamable HTTP)** — a long-lived server you connect to by URL
-  (`http://localhost:3000/mcp`). Best for `git clone && npm install &&
-  npm start` plus the [HTTP-transport config block](#claude-desktop) shown
-  above. Clients never spawn the process; they connect to the port.
+```bash
+git clone https://github.com/PatterAI/patter-mcp
+cd patter-mcp && npm install && npm run build
+```
 
-- **stdio** — the server runs as a subprocess the client spawns via
-  `npx -y getpatter-mcp --stdio`, communicating over stdin/stdout. This is
-  what local desktop MCP clients (OpenClaw, Hermes, Claude Desktop) expect.
-  See [stdio transport](#stdio-transport-openclaw--hermes--claude-desktop).
+It then serves two transports from that checkout:
 
-A couple of `npx -y` caveats worth knowing:
+- **HTTP (Streamable HTTP)** — `npm start` runs a long-lived server you connect to
+  by URL (`http://localhost:3000/mcp`). Clients never spawn the process; they
+  connect to the port.
 
-- **Cold start.** `cloudflared` (postinstall binary download) can push the
-  first `npx -y` into the 30s+ range. The embedded tunnel only boots on the
-  first `make_call` (lazy lifecycle), so listing tools and dry runs stay fast,
-  but the very first real call after a fresh install pays the download once.
+- **stdio** — the client spawns the built server as a subprocess
+  (`node dist/index.js --stdio`), communicating over stdin/stdout. This is what
+  local desktop MCP clients (OpenClaw, Hermes, Claude Desktop) expect. See
+  [stdio transport](#stdio-transport-openclaw--hermes--claude-desktop).
 
-- **Supply-chain hygiene.** Recent npm supply-chain attacks (Shai-Hulud,
-  Sep 2025; mini-Shai-Hulud, May 2026) targeted MCP-adjacent packages. If you
-  prefer not to resolve a fresh tarball on every launch, `git clone && npm
-  install` with the HTTP transport keeps the trust boundary on the repo + your
-  carrier credentials.
+> **Cold start.** `cloudflared` downloads its binary on first install, and the
+> embedded tunnel boots on the first `make_call` (lazy lifecycle) — so listing
+> tools and dry runs stay fast, but the very first real call after a fresh setup
+> pays the one-time download.
 
 ## Contributing
 
