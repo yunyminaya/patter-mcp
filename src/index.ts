@@ -9,6 +9,7 @@
 
 import { z } from "zod";
 import { MCPServer, oauthAuth0Provider } from "mcp-use/server";
+import type { McpServer as OfficialMcpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import { createPatter, getPatter, maybeEagerBoot, isPatterBooting } from "./patter-lifecycle.js";
 import {
@@ -42,6 +43,26 @@ import { registerCallResources } from "./resources/call-resources.js";
 
 const MCP_PORT = parseInt(process.env.MCP_PORT ?? "3000", 10);
 const PATTER_PORT = parseInt(process.env.PATTER_PORT ?? "8000", 10);
+
+// Transport selection. Default is HTTP (Streamable HTTP at /mcp); pass
+// `--stdio` (or MCP_TRANSPORT=stdio) to run over a stdio subprocess
+// transport that a local MCP client (OpenClaw, Hermes, Claude Desktop)
+// spawns via `npx getpatter-mcp --stdio`.
+const USE_STDIO =
+  process.argv.slice(2).includes("--stdio") || process.env.MCP_TRANSPORT === "stdio";
+
+// In stdio mode, stdout MUST carry nothing but the JSON-RPC stream — any stray
+// console.log/info/debug from this process OR a dependency (mcp-use's tool/
+// resource registration, getpatter, cloudflared) would corrupt it. Reroute the
+// console info-channels to stderr BEFORE any registration runs. This is set at
+// module load (not inside startStdio) so it also covers the registration calls
+// that execute at import time. The SDK's StdioServerTransport writes frames via
+// process.stdout.write directly, bypassing console.*, so stdout stays pure.
+if (USE_STDIO) {
+  console.log = (...args: unknown[]) => process.stderr.write(`${args.join(" ")}\n`);
+  console.info = console.log;
+  console.debug = console.log;
+}
 
 function log(msg: string): void {
   process.stderr.write(`[patter-mcp] ${msg}\n`);
@@ -322,12 +343,28 @@ server.tool(
 registerCallDashboard(server, patter);
 registerCallResources(server, patter);
 
+// The single long-lived native MCP server connected over stdio, when running
+// in --stdio mode. mcp-use's HTTP fan-out (server.sendNotification /
+// server.notifyResourceUpdated) iterates per-HTTP-session servers, which are
+// empty under stdio — so inbound lifecycle events must be routed to this
+// instance directly. Undefined in the default HTTP path.
+let stdioNative: OfficialMcpServer | undefined;
+
 // Bridge inbound lifecycle events (incoming_call / call_ended) to MCP
 // notifications, and nudge subscribers of the active-calls resource.
 patter.setNotifier((method, params) => {
   try {
-    void Promise.resolve(server.sendNotification(method, params)).catch(() => {});
-    void Promise.resolve(server.notifyResourceUpdated("patter://calls/active")).catch(() => {});
+    if (stdioNative) {
+      // stdio: exactly one session — emit straight to its native server.
+      void Promise.resolve(stdioNative.server.notification({ method, params })).catch(() => {});
+      void Promise.resolve(
+        stdioNative.server.sendResourceUpdated({ uri: "patter://calls/active" }),
+      ).catch(() => {});
+    } else {
+      // HTTP: fan out across all active mcp-use sessions.
+      void Promise.resolve(server.sendNotification(method, params)).catch(() => {});
+      void Promise.resolve(server.notifyResourceUpdated("patter://calls/active")).catch(() => {});
+    }
   } catch {
     /* notifications are best-effort */
   }
@@ -352,7 +389,51 @@ server.app.get("/health", (c) =>
 // Start
 // ---------------------------------------------------------------------------
 
+/**
+ * Run the SAME registered tools/resources over a stdio transport.
+ *
+ * `server.getServerForSession()` builds a fresh native MCP server and replays
+ * every tool/resource/prompt registered on the mcp-use server onto it — so the
+ * 7 tools and all resources are shared verbatim with the HTTP path; nothing is
+ * duplicated. We then connect that single instance to a StdioServerTransport.
+ * No HTTP port is opened: /health, /inspector and OAuth are HTTP-only and
+ * simply don't exist in stdio mode (the transport is the trust boundary).
+ *
+ * Logs go to stderr only — stdout carries the raw JSON-RPC stream and must stay
+ * pure, so no ASCII banner is emitted here.
+ */
+async function startStdio(): Promise<{ close: () => Promise<void> }> {
+  await maybeEagerBoot();
+
+  const { StdioServerTransport } = await import(
+    "@modelcontextprotocol/sdk/server/stdio.js"
+  );
+  const native = server.getServerForSession();
+  const transport = new StdioServerTransport();
+  stdioNative = native;
+  await native.connect(transport);
+
+  log(`patter-mcp running on stdio (tools: make_call, call_third_party, get_calls, get_transcript, end_call, get_metrics, configure_inbound)`);
+  log(`Phone number:  ${patter.phoneNumber}`);
+  log(`Lifecycle:     ${process.env.PATTER_EAGER === "1" ? "eager" : "lazy (boot on first tool call)"}`);
+
+  return {
+    close: async () => {
+      try {
+        await native.close();
+      } catch {
+        /* best-effort */
+      }
+    },
+  };
+}
+
 async function main(): Promise<void> {
+  if (USE_STDIO) {
+    stdioHandle = await startStdio();
+    return;
+  }
+
   await maybeEagerBoot();
 
   // Start MCP HTTP server (inspector auto-available at /inspector)
@@ -391,6 +472,9 @@ Patter MCP Server
 
 let shuttingDown = false;
 
+/** The active stdio transport handle, set in --stdio mode for clean teardown. */
+let stdioHandle: { close: () => Promise<void> } | undefined;
+
 /**
  * Tear the embedded Patter server down on process termination.
  *
@@ -405,6 +489,10 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   log(`Received ${signal} — shutting down...`);
   try {
+    // Close the stdio transport first so the JSON-RPC pipe isn't left half-open.
+    if (stdioHandle) {
+      await stdioHandle.close();
+    }
     if (isPatterBooting()) {
       const p = await getPatter();
       await p.disconnect();

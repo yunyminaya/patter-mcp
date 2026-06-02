@@ -11,7 +11,7 @@
 <p align="center">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/typescript-5.0%2B-3178c6?logo=typescript&logoColor=white" alt="TypeScript 5+" />
-  <img src="https://img.shields.io/badge/MCP-Streamable%20HTTP-black?logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMCIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyIi8+PC9zdmc+" alt="MCP" /></a>
+  <img src="https://img.shields.io/badge/MCP-HTTP%20%2B%20stdio-black?logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMCIgc3Ryb2tlPSJ3aGl0ZSIgc3Ryb2tlLXdpZHRoPSIyIi8+PC9zdmc+" alt="MCP" /></a>
   <a href="https://github.com/PatterAI/Patter"><img src="https://img.shields.io/badge/Patter%20SDK-0.6.3-orange" alt="Patter SDK" /></a>
 </p>
 
@@ -26,7 +26,7 @@
 
 An MCP server that gives your AI agent a phone number. Answer calls, dial out, edit code, call APIs, book meetings — all over voice.
 
-Built on the [Patter](https://github.com/PatterAI/Patter) Voice AI SDK. Claude Code connects via Streamable HTTP and gets access to voice calling tools. During calls, the AI agent can read files, run commands, and search code in real time.
+Built on the [Patter](https://github.com/PatterAI/Patter) Voice AI SDK. Claude Code connects over Streamable HTTP or stdio and gets access to voice calling tools. During calls, the AI agent can read files, run commands, and search code in real time.
 
 ## Quickstart
 
@@ -49,9 +49,25 @@ npm run build && npm start   # production
 
 ### 3. Connect Claude Code
 
+Two transports are supported. **HTTP** (default) runs a long-lived server you
+connect to by URL; **stdio** lets an MCP client spawn the server as a
+subprocess (no port, no URL).
+
+**HTTP (default):**
+
 ```bash
+npm run dev    # or: npm run build && npm start  — serves Streamable HTTP at :3000/mcp
 claude mcp add --transport http patter-mcp http://localhost:3000/mcp
 ```
+
+**stdio:** pass `--stdio` and the client launches the server itself:
+
+```bash
+claude mcp add patter-mcp -- npx -y getpatter-mcp --stdio
+```
+
+See [stdio transport](#stdio-transport-openclaw--hermes--claude-desktop) for
+OpenClaw and Hermes config.
 
 ### 4. Use it
 
@@ -73,6 +89,9 @@ Ask Claude:
 | `call_third_party` | Call a third party with an autonomous task (e.g. restaurant reservation); waits and returns the transcript |
 | `get_calls` | List all calls with status, duration, and cost |
 | `get_transcript` | Get the full conversation transcript of a call |
+| `end_call` | Hang up an in-progress call |
+| `get_metrics` | Read latency / token / cost metrics |
+| `configure_inbound` | Configure how inbound calls are answered |
 
 Both `make_call` and `call_third_party` are **completion-aware**: they block until
 the call reaches a terminal state and return a structured outcome
@@ -284,6 +303,88 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
+### stdio transport (OpenClaw / Hermes / Claude Desktop)
+
+Local MCP clients that prefer to **spawn** the server as a subprocess (rather
+than connect to a URL) use the stdio transport. Launch it with the `--stdio`
+flag (or `MCP_TRANSPORT=stdio`):
+
+```bash
+npx -y getpatter-mcp --stdio
+# stdout carries the raw JSON-RPC stream; all logs go to stderr.
+```
+
+In stdio mode no HTTP port is opened, so `/health`, the `/inspector` UI, and
+Auth0 OAuth are unavailable — the subprocess boundary is the trust boundary, so
+the client owns the process. Tools, resources, and lazy lifecycle behave
+exactly as in HTTP mode.
+
+> **Long-call timeout (important).** `make_call` / `call_third_party` block
+> until the call ends, which can exceed a client's default MCP timeout. Raise
+> the per-server timeout (see the snippets below) or those calls get killed
+> mid-call — same as for the HTTP transport.
+
+**OpenClaw** — `~/.openclaw/openclaw.json` (JSON5). Set the server under
+`mcp.servers`, raise the timeout above 20 s, and allowlist the MCP tools in the
+sandbox (without `alsoAllow` the tools exist but the agent can't call them):
+
+```json5
+{
+  mcp: {
+    servers: {
+      "patter-mcp": {
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "getpatter-mcp", "--stdio"],
+        env: {
+          TWILIO_ACCOUNT_SID: "AC...",
+          TWILIO_AUTH_TOKEN: "...",
+          TWILIO_PHONE_NUMBER: "+15551234567",
+          OPENAI_API_KEY: "sk-...",
+        },
+        timeout: 120, // seconds — a phone call exceeds the ~20s default
+      },
+    },
+  },
+  tools: {
+    sandbox: {
+      tools: {
+        alsoAllow: ["bundle-mcp"], // or "patter__*"
+      },
+    },
+  },
+}
+```
+
+**Hermes** — `~/.hermes/config.yaml`, under `mcp_servers`. Raise `timeout`
+(default 120 s) for long `wait:true` calls:
+
+```yaml
+mcp_servers:
+  patter-mcp:
+    command: npx
+    args: ["-y", "getpatter-mcp", "--stdio"]
+    env:
+      TWILIO_ACCOUNT_SID: "AC..."
+      TWILIO_AUTH_TOKEN: "..."
+      TWILIO_PHONE_NUMBER: "+15551234567"
+      OPENAI_API_KEY: "sk-..."
+    timeout: 600  # seconds — long calls can run minutes
+```
+
+**Claude Desktop** — stdio variant of the config above:
+
+```json
+{
+  "mcpServers": {
+    "patter-mcp": {
+      "command": "npx",
+      "args": ["-y", "getpatter-mcp", "--stdio"]
+    }
+  }
+}
+```
+
 ## Development
 
 ```bash
@@ -294,34 +395,30 @@ npm start            # Run built version
 
 ## Distribution
 
-`patter-mcp` is distributed as a **GitHub repository**, not an npm
-package. The recommended install path is `git clone && npm install &&
-npm start` — pair it with the [Claude Code / Hermes / OpenClaw / Cursor
-HTTP-transport config block](#claude-desktop) shown above.
+`patter-mcp` ships in two transports:
 
-Why not `npx -y getpatter-mcp` like other MCP servers?
+- **HTTP (Streamable HTTP)** — a long-lived server you connect to by URL
+  (`http://localhost:3000/mcp`). Best for `git clone && npm install &&
+  npm start` plus the [HTTP-transport config block](#claude-desktop) shown
+  above. Clients never spawn the process; they connect to the port.
 
-1. **HTTP transport, not stdio.** patter-mcp uses
-   [`mcp-use/server`](https://github.com/mcp-use/mcp-use) over HTTP, so
-   clients connect by URL. They never need to `npx`-launch the server
-   as a subprocess. The `npx -y` install path is required only for
-   stdio servers.
+- **stdio** — the server runs as a subprocess the client spawns via
+  `npx -y getpatter-mcp --stdio`, communicating over stdin/stdout. This is
+  what local desktop MCP clients (OpenClaw, Hermes, Claude Desktop) expect.
+  See [stdio transport](#stdio-transport-openclaw--hermes--claude-desktop).
 
-2. **Native dependencies are slow.** `better-sqlite3` (compiled via
-   `node-gyp`) and `cloudflared` (postinstall binary download) push
-   the cold-start of `npx -y` into the 30s+ range — a poor first
-   impression for an MCP server. `git clone && npm install` does the
-   same work once, up-front, with no surprise.
+A couple of `npx -y` caveats worth knowing:
 
-3. **Supply-chain blast radius.** Recent npm supply-chain attacks
-   (Shai-Hulud, Sep 2025; mini-Shai-Hulud, May 2026) explicitly
-   targeted MCP-adjacent packages. GitHub-only distribution keeps the
-   trust boundary on the repo + Cloudflare/Twilio carrier
-   credentials, not on a freshly-downloaded npm tarball.
+- **Cold start.** `cloudflared` (postinstall binary download) can push the
+  first `npx -y` into the 30s+ range. The embedded tunnel only boots on the
+  first `make_call` (lazy lifecycle), so listing tools and dry runs stay fast,
+  but the very first real call after a fresh install pays the download once.
 
-The package is structurally ready for npm publish (has `bin` entry,
-shebang, and `files` array) — if the broader Patter community asks
-for `npx -y` later, we can flip it on without a refactor.
+- **Supply-chain hygiene.** Recent npm supply-chain attacks (Shai-Hulud,
+  Sep 2025; mini-Shai-Hulud, May 2026) targeted MCP-adjacent packages. If you
+  prefer not to resolve a fresh tarball on every launch, `git clone && npm
+  install` with the HTTP transport keeps the trust boundary on the repo + your
+  carrier credentials.
 
 ## Contributing
 

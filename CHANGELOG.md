@@ -4,6 +4,33 @@ All notable changes to patter-mcp are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- **stdio transport (`--stdio`).** Launch with `npx -y getpatter-mcp --stdio`
+  (or `MCP_TRANSPORT=stdio`) to run over a stdio subprocess transport that a
+  local MCP client (OpenClaw, Hermes, Claude Desktop) spawns directly — no HTTP
+  port, no URL. The default (no flag) is unchanged: Streamable HTTP at
+  `:3000/mcp`. Both modes serve the SAME 7 tools and resources; the stdio path
+  reuses mcp-use's `getServerForSession()` to replay every registration onto a
+  native `@modelcontextprotocol/sdk` server connected to a
+  `StdioServerTransport`, so nothing is duplicated
+  (`src/index.ts` → `startStdio`). In stdio mode `/health`, the `/inspector`
+  UI, and Auth0 OAuth are unavailable (HTTP-only); the subprocess boundary is
+  the trust boundary.
+
+### Fixed
+
+- **stdout purity in stdio mode.** A stray `console.log` in the mcp-use
+  resource-template registration would otherwise corrupt the JSON-RPC stream.
+  `src/index.ts` now reroutes `console.log` / `console.info` / `console.debug`
+  to stderr when `--stdio` is set, before any registration runs, so stdout
+  carries nothing but MCP protocol frames. Inbound lifecycle notifications
+  (`incoming_call` / `call_ended`) and the active-calls resource nudge are
+  routed to the stdio-connected native server (mcp-use's HTTP session fan-out
+  is empty under stdio); graceful shutdown also closes the stdio transport.
+
 ## 0.4.0
 
 Adopts the completion-aware outbound primitive from `getpatter@0.6.3`.
