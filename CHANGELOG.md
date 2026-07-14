@@ -20,6 +20,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   UI, and Auth0 OAuth are unavailable (HTTP-only); the subprocess boundary is
   the trust boundary.
 
+### Changed
+
+- **Bumped `getpatter` dependency `^0.6.3` → `^0.7.0`.** Picks up the SDK's
+  0.7.0 line: the OpenAI Realtime GA migration, rate-aware resampler and
+  word-accurate barge-in audio fixes, user-supplied agent skills, and
+  token-aware memory compaction. No patter-mcp source changes were required —
+  the public API surface the server depends on (`Patter` constructor,
+  `phone.call({ wait: true })` CallResult shape, `startServer`/`endCall`/
+  `setNotifier`, and the provider/engine classes in `src/agent-config.ts`) is
+  unchanged across the upgrade; the full 145-test suite and the stdio handshake
+  smoke test pass as-is.
+
 ### Fixed
 
 - **stdout purity in stdio mode.** A stray `console.log` in the mcp-use

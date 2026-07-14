@@ -24,7 +24,7 @@
     "@anthropic-ai/claude-agent-sdk": "^0.2.109",
     "cloudflared": "^0.7.1",
     "e2b": "^2.19.0",
-    "getpatter": "^0.6.3",
+    "getpatter": "^0.7.0",
     "libphonenumber-js": "^1.12.41",
     "mcp-use": "^1.24.0",
     "zod": "^4.0.0"
